@@ -29,13 +29,6 @@ In the following, we will specify the requested KPIs and split them up into indi
 Splitting up the requested KPIs into individual queries allows for more flexibility in how the KPIs are later displayed.
 
 
-To implement some of the KPIs we require stats that are fetched in a periodic fashion (e.g. the evolution of loanable items over a time period).
-All previous ILS stats are based on events, e.g. "a record is viewed or "an e-item is downloaded".
-Queries that can be implemented by listening to signals are marked with "event: \<description of the signal/event that produces this stat\>".
-Queries that are not based on events, but collected in a fixed periodic fashion, are marked with "requires: periodic-event-stats". 
-The feature of periodic stats is described in more detail at the end of this section.
-
-
 By the design of `invenio-stats`, all stats are aggregated.
 Currently, this aggregation is always done over a certain `field` (a field to group the documents in the events index by).
 Some of our KPIs do not have such a `field`, as all documents should be grouped together.
@@ -46,15 +39,14 @@ Queries that require this change are marked with "requires: global-aggregation" 
 1. Turnover rate of the Library collection:
    1. number of new loans / number of loanable items
        - query - number of new loans:
-         - implemented with KPI 3.1 or 4.4
+        - Is already possible with Invenio ILS, but no time series data will be available
+          - can be queried from the api by requesting `state=ITEM_ON_LOAN&state=ITEM_RETURNED&loans_from_date=2025-09-01&loans_to_date=2025-09-01`
+            - number is in `hits.total`
+        - TODO: better implementation with histogram based on start_date of loans
        - query - number of loanable items:
-         - requires: 
-           - periodic-event-stats
-           - global-aggregation
-         - aggregate:
-           - count of items that have `status`: `CAN_CIRCULATE`
-           - daily
-           - over no field
+        - Is already possible with Invenio ILS, but no time series data will be available
+          - can be queried from the api by requesting `/api/items/?page=1&size=1`
+            - number is in `aggregations.status.buckets.first(x => x.key == "CAN_CIRCULATE").doc_count` 
        - NOTE: this KPI is described in ISO 11620:2023 A.2.1.1
    2. number of renewals / number of loanable items
        - query - number of renewals: 
@@ -72,6 +64,7 @@ Queries that require this change are marked with "requires: global-aggregation" 
 
 
 2. Average duration of loan:
+    TODO
      1. Average loan durations := loan duration / number of completed loans
           - query - loan duration (= Loan start date - Loan end date)
             - requires:
@@ -84,18 +77,13 @@ Queries that require this change are marked with "requires: global-aggregation" 
               - monthly
               - over no field
          - query - number of completed loans:
-           - requires:
-             - global-aggregation 
-           - event: loan ends  
-             - use signal `invenio_circulation.signals.loan_state_changed`
-             - create event when transition is to the `state` `ITEM_RETURNED`
-           - aggregate:
-             - count
-             - monthly
-             - over no field
+           - Is already possible with Invenio ILS, but no time series data will be available
+             - can be queried from the api by filtering for `state=ITEM_RETURNED` 
+               - date can be filtered by either using `start_date` or `end_date`
 
 
 3. Availability of requested documents:
+     TODO
      1. Loan creations:
          - query: number of loan creations
            - event: loan creation
@@ -170,6 +158,7 @@ Queries that require this change are marked with "requires: global-aggregation" 
 
 5. Patrons:
     1. Number of unique patrons with an activity on their account for a given period (logging in counts as active)
+        - TODO: figure out period
         - query: count distinct patron ids that logged in
           - requires:
             - global-aggregation
@@ -181,22 +170,14 @@ Queries that require this change are marked with "requires: global-aggregation" 
     2. Loan issued for a period associated with Patron's department
         - query: count loan creations grouped by patron department
           - solved through 3.1
-            - add extra aggregation over patron department name
-              - is added by event preprocessing and extracted from the field `extra_data` from `invenio_oauthclient.model.RemoteAccount` during the event creation
+            - search for 
 
 
 6. Overdue loans;
     1. Percentage of overdue loans (active overdue loans / active loans)
         - Is already possible with Invenio ILS, but no time series data will be available
-          - can be queried from the api by filtering for `is_overdue` and `state`
-        - query - number of active loans and active overdue loans:
-          - requires: 
-            - periodic-event-stats
-          - aggregate:
-            - number of active overdue and active loans
-              - active := `state` is `ITEM_ON_LOAN`
-            - daily
-            - over field `is_overdue`
+          - can be queried from the api by requesting `/api/circulation/loans/?page=1&size=1`
+            - result is in `aggregations.returns.end_date.buckets.first(x => x.key == "Overdue").doc_count` and `aggregations.state.buckets.first(x => x.key == "ITEM_ON_LOAN").doc_count`
 
 
 7. Purchase orders:
@@ -257,10 +238,12 @@ Queries that require this change are marked with "requires: global-aggregation" 
              - count
              - monthly
              - over no field
+
     2.  Fulfillment: percentage of accepted vs. declined literature requests (differentiate decline reason 'available in catalogue' from other reasons).
           - Is already possible with Invenio ILS, but no time series data will be available
-            - can be queried from the api by filtering for the state and decline reason and looking at the field total of the result
-              - e.g.: `<host>/api/document-requests/?q=&sort=-created&page=1&size=15&state=DECLINED&decline_reason=IN_CATALOG`
+            - can be queried from the api by requesting `/api/document-requests/?page=1&size=1`
+              - result is in `aggregations.state.buckets.first(x => x.key == "ACCEPTED").doc_count` and `aggregations.state.buckets.first(x => x.key == "DECLINED").doc_count`
+              - results for decline reason are in `aggregations.decline_reason.buckets`
 
 
 ### Requirements for KPIs
@@ -273,85 +256,6 @@ If field is set to `None`, the aggregation is done over all documents in the ind
 
 A possible implementation of this can be seen [here](https://github.com/inveniosoftware/invenio-stats/pull/164).
 
-#### Periodic Stats - periodic-event-stats
-Some of our KPIs require stats that are not based on events, but rather calculated on a regular basis (e.g. "query - number of loanable items").
-We thus propose to add the method `process_periodic_stats` to `invenio-app-ils`, which is called daily by celery-beat.
-It receives a list of the names of the stats to be processed and manually emits an event for each of them.
-
-
-##### config.py
-```py
-CELERY_BEAT_SCHEDULE = {
-    "stats_process_periodic_daily": {
-        "task": "invenio_app_ils.stats.event_builders.process_periodic_stats",
-        "schedule": crontab(minute=0, hour=3),  # every day, 3am
-        "args": [["items-count"]],
-    },
-}
-
-STATS_EVENTS = {
-    "items-count": {
-        "templates": "invenio_app_ils.stats.templates.events.items_count",
-        "event_builders": ["invenio_app_ils.stats.event_builders.count_items"],
-        "cls": EventsIndexer,
-        "params": {
-            "preprocessors": [
-                "invenio_app_ils.stats.processors.add_timestamp_as_unique_id",
-            ],
-            "double_click_window": 30,
-            "suffix": "%Y-%m",
-        },
-    }
-}
-```
-
-##### event_builders.py
-```py
-def process_periodic_stats(stat_names):
-    """Process periodic stats."""
-    for stat_name in stat_names:
-        current_stats.publish(stat_name, [count_items({})])
-
-def count_items(event):
-    """Count available items."""
-    event.update(
-        {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "available_items_count": current_app_ils.item_search_cls()
-            .filter("term", status="CAN_CIRCULATE")
-            .count(),
-        }
-    )
-
-    return event
-```
-
-An example implementation of the daily counting of available items ("query - number of loanable items") can be seen [here](https://github.com/inveniosoftware/invenio-app-ils/pull/1246)
-
-
-## How we teach this
-
-###  Regarding Periodic Stats
-We propose the term `periodic` to be added to all code related to this feature (e.g. `process_periodic_stats`).
-This makes it clear that these are not event based, but collected on a regular basis.
-
-
-## Drawbacks
-
-### Periodic Stats
-By implementing periodic stats to be added as events, it is easy to run into situations, where invenio-stats always only aggregates one document per time period.
-This is because the periodic events in this RFC are aggregations themselves.
-The stats `query - number of loanable items` from 1.1 is an example of this.
-We count the number of items on a daily basis, resulting in one event/document per day in the events index.
-We then later aggregate daily, resulting in one document per day in the aggregations index, which contains the data of only one event.
-This is not a problem per se, but can be seen as unclean and a duplication of the data.
-
-### Splitting up KPIs into multiple queries
-The KPIs are split up into multiple queries.
-While this allows for more flexibility, it also requires the Dashboard to perform some aggregations itself.
-This makes it less possible for dashboards that are possibly built in the future on top of `invenio-stats` to display aggregations, to directly display the KPIs, as they have to know how to combine the individual queries into the requested KPIs.
-(A possible implementation of such a dashboard was discussed [here](https://github.com/inveniosoftware/product-rdm/discussions/182).)
-That said, as the events are stored in `invenio-stats`, it is always possible to create new aggregations for the KPIs in the future, if a dashboard requires it.
 
 ## Alternatives
 
@@ -409,14 +313,3 @@ The different endpoints called to create a loan are:
 We could call a new signal `loan_created` from those endpoints with a parameter indicating the creation method.
 
 Alternatively, we could just listen to the signal `after_record_insert` from `invenio_records`, filter for loans and only during event generation or preprocessing extract the creation method. (Unsure if possible)
-
-#### Median vs. Average
-Should the aggregation of the loan duration and waiting time also be done on a median basis?
-ISO 11620:2023 recommends the median as a more robust measure for the waiting time.
-An additional aggregation could be added.
-
-#### Aggregation period
-We aggregate most stats on a daily basis.
-An exception of this are the loan durations and waiting times, which are aggregated monthly.
-Should we also aggregate those on a daily basis?
-In case the median is added as an additional aggregation, this would make it less reliable, as the median of a single day is not very meaningful.
